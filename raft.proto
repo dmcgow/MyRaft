@@ -1,0 +1,15 @@
+syntax = "proto3";
+option go_package = "./;main";
+package main;
+enum MessageType{
+  MsgBeat = 0;
+  MsgVote = 1;
+}
+
+message Raft {
+  MessageType Type = 1;
+  int64 CurrentTerm = 2;
+  int64 VotedFor = 3;
+  bool Alive = 4;
+  bool Reject = 5;
+}
