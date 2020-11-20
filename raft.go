@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -12,89 +11,74 @@ import (
 	"sync"
 	"time"
 )
-type StateType int
-const (
-	Follower StateType = 1
-	Leader StateType = 2
-	Candidate StateType = 3
-)
 var (
-	mu sync.Mutex
-	voteTimer = time.NewTicker(100 * time.Second)
-	heartbeatTimer *time.Ticker
-	voteTimeout int
-	heartbeatTimeout int
-	currentStateType StateType = Follower
-	conns [3]*rpc.Client
+	node             Node
+	mu               sync.Mutex
+	VoteTimer        = time.NewTicker(100 * time.Second)
+	Conns            [3]*rpc.Client
+	LinkType         [3]LinkStateType
 )
-
 type RaftRpc struct{
-
 }
 type Config struct{
 	Ip string
-	Port string
 	Peers []string
 	ClusterSize int64
-	VoteCount int64
-	Term int64
 	Id int64
-	Leader int64
 }
+
 var config = getConfig("./config.json")
-func (r *RaftRpc) HeartBeat(request Raft,response *Raft) error {
+func (r *RaftRpc) HeartBeat(request *Raft,response *Raft) error {
 	switch request.Type{
 	case MessageType_MsgBeat:
-		err := Tick(request,response)
-		if err != nil{
-			Log(err.Error())
-		}
-		break
+		_ = Tick(request,response)
 	case MessageType_MsgVote:
-		err := Vote(request,response)
-		if err != nil{
-			Log("vote failed")
-		}
-		break
+		_ = Vote(request,response)
 	}
-
 	return nil
 }
-func Vote(request Raft,response *Raft) error {
-	if currentStateType == Candidate{
-		return errors.New("candidate can not vote for me")
-	}
-	if currentStateType == Leader{
-		return errors.New("leader can not vote for me")
-	}
-	if request.CurrentTerm < config.Term{
-		return errors.New("term is smaller than follower")
-	}
-	config.Leader = request.VotedFor
-	config.Term = response.CurrentTerm
-	response.Alive = true
-	response.Reject = true
-	voteTimeout = rand.Int() % 3 + 3
-	voteTimer.Reset(time.Duration(voteTimeout) * time.Second)
-	return nil
-}
-func Tick(request Raft,response *Raft) error {
-	voteTimeout = rand.Int() % 3 + 3
-	voteTimer.Reset(time.Duration(voteTimeout) * time.Second)
-	if request.CurrentTerm < config.Term{
-		response.Alive = true
-		response.Reject = true
-		response.CurrentTerm = config.Term
-		return errors.New("heart beat rejected")
-		//need polish
-	} else {
-		response.Alive = true
-		response.Reject = false
-		config.Leader = request.VotedFor
-		config.Term = request.CurrentTerm
-		Log("heart beat from ",request.VotedFor," in term ",config.Term)
+func Vote(request *Raft,response *Raft) error {
+	if request.Term < node.Term{
+		response.Term = node.Term
+		response.Log = "vote rejected"
 		return nil
 	}
+	if request.Term > node.Term{
+		mu.Lock()
+		node.Term = request.Term
+		node.VoteFor = request.VotedFor
+		mu.Unlock()
+		BecomeFollower()
+		response.Log = "vote success"
+		return nil
+	}
+	if node.CurrentStateType == StateType_Follower{
+		if node.VoteFor == 0{
+			mu.Lock()
+			node.VoteFor = request.VotedFor
+			node.Term = request.Term
+			mu.Unlock()
+			ResetVoteTimer(VoteTimer)
+			response.Log = "vote success"
+		}else{
+			response.Log = "vote rejected"
+		}
+		return nil
+	}
+	response.Log = "vote rejected"
+	return nil
+}
+func Tick(request *Raft,response *Raft) error {
+	if node.Term > request.Term{
+		response.Term = node.Term
+		response.Log = "become follower"
+		return nil
+	}
+	BecomeFollower()
+	mu.Lock()
+	node.Term = request.Term
+	mu.Unlock()
+	return nil
 }
 func Log(val... interface{}){
 	fmt.Println(val)
@@ -113,7 +97,17 @@ func getConfig(path string) Config {
 	}
 	return val
 }
-
+func Connect(index int){
+	LinkType[index] = LinkStateType_Connecting
+	var err error
+LOOP:
+	Conns[index],err = rpc.DialHTTP("tcp", config.Peers[index])
+	if err != nil{
+		goto LOOP
+	}
+	LinkType[index] = LinkStateType_Connected
+	Log("connect peer ",config.Peers[index]," successful")
+}
 func Init(){
 	err := rpc.Register(new(RaftRpc))
 	if err != nil{
@@ -125,115 +119,129 @@ func Init(){
 		err = http.ListenAndServe(addr,nil)
 		if err != nil{
 			log.Fatal(err)
-			return
 		}
-	}(config.Ip + ":" + config.Port)
-	for i := 0;i < int(config.ClusterSize - 1);i ++{
-		go func(j int){
-			var err error
-		LOOP:
-			conns[j],err = rpc.DialHTTP("tcp", config.Peers[j])
-			if err != nil{
-				goto LOOP
-			}
-		}(i)
+	}(config.Ip)
+	for i := 0;i < int(config.ClusterSize);i ++{
+		LinkType[i] = LinkStateType_Disconnected
+		if config.Id == int64(i + 1){
+			continue
+		}
+		go Connect(i)
 	}
-	go election()
+	BecomeFollower()
+	fmt.Println("become follower")
 }
-func election(){
-	currentStateType = Candidate
-	voteTimeout = rand.Int() % 3 + 3
-	voteTimer.Reset(time.Duration(voteTimeout) * time.Second)
+
+func BecomeLeader(){
+	mu.Lock()
+	node.CurrentStateType = StateType_Leader
+	Log("I am leader in term ",node.Term," when ",time.Now())
+	mu.Unlock()
+	for i := 0;i < int(config.ClusterSize);i ++{
+		go startHeartbeat(i)
+	}
+}
+func BecomeFollower(){
+	mu.Lock()
+	Log("I am follower in term ",node.Term," when ",time.Now())
+	node.CurrentStateType = StateType_Follower
+	ResetVoteTimer(VoteTimer)
+	mu.Unlock()
+}
+func BecomeCandidate(){
+	mu.Lock()
+	Log("I am candidate in term ",node.Term," when ",time.Now())
+	node.CurrentStateType = StateType_Candidate
+	node.Term ++
+	node.VoteCount = 1
+	ResetVoteTimer(VoteTimer)
+	mu.Unlock()
+}
+func ResetVoteTimer(ticker *time.Ticker){
+	node.ElectionTimeout = int64(rand.Int() % 150 + 150)
+	ticker.Reset(time.Duration(node.ElectionTimeout) * time.Millisecond)
+}
+func ResetHeartBeatTimer(ticker *time.Ticker){
+	node.HeartBeatTimeout = int64(rand.Int() % 30 + 15)
+	ticker.Reset(time.Duration(node.HeartBeatTimeout) * time.Millisecond)
+}
+
+func Election(){
 	for{
 		select{
-			case <- voteTimer.C:
-				Log("vote timeout")
-				currentStateType = Candidate
-				config.VoteCount = 1
-				config.Term += 1
-				voteTimeout = rand.Int() % 3 + 3
-				voteTimer.Reset(time.Duration(voteTimeout) * time.Second)
+			case <- VoteTimer.C:
+				Log("Election Time Out")
+				BecomeCandidate()
 				raft := Raft{
 					Type: MessageType_MsgVote,
-					CurrentTerm: config.Term,
+					Term: node.Term,
 					VotedFor: config.Id,
+					Log: "",
 				}
-				for i := 0;i < int(config.ClusterSize - 1);i ++{
-					go func(index int){
-						if conns[index] == nil{
+				for i := 0;i < int(config.ClusterSize);i ++{
+					if config.Id == int64(i + 1) || Conns[i] == nil{
+						continue
+					}
+					go func(index int,rf Raft){
+						err := Conns[index].Call("RaftRpc.HeartBeat",rf,&rf)
+						if err != nil && LinkType[index] == LinkStateType_Connected{
+							Log("TRY")
+							go Connect(index)
+						}
+						if err != nil{
 							return
 						}
-						err := conns[index].Call("RaftRpc.HeartBeat",raft,&raft)
-						if err != nil{
-							Log(err)
-						}else{
+						if rf.Log == "vote success" && node.CurrentStateType == StateType_Candidate{
 							mu.Lock()
-							config.VoteCount ++
+							node.VoteCount ++
 							mu.Unlock()
-							Log("got voted in term: ",config.Term)
-							Log("vote count ",config.VoteCount)
-							if config.VoteCount > config.ClusterSize / 2{
-								voteTimer.Stop()
-								if currentStateType == Leader{
-									return
-								}
-								mu.Lock()
-								currentStateType = Leader
-								mu.Unlock()
-								Log("i am leader")
-								becomeLeader()
-							}
-
 						}
-					}(i)
+						if rf.Log == "vote rejected"{
+							mu.Lock()
+							node.Term = raft.Term
+							mu.Unlock()
+						}
+						if node.VoteCount > config.ClusterSize / 2 && node.CurrentStateType == StateType_Candidate{
+							BecomeLeader()
+							VoteTimer.Stop()
+						}
+					}(i,raft)
 				}
 		}
-	}
-}
-func becomeLeader(){
-	for i := 0;i < int(config.ClusterSize - 1);i ++{
-		go startHeartbeat(i)
 	}
 }
 func startHeartbeat(index int){
 	raft := Raft{
-		Alive: false,
-		VotedFor: 0,
-		CurrentTerm: config.Term,
+		Term: node.Term,
+		Log: "",
 	}
-	heartbeatTimeout = rand.Int() % 100 + 100
-	heartbeatTimer = time.NewTicker((time.Duration(heartbeatTimeout)) * time.Millisecond)
-	raft.Alive = false
-	raft.VotedFor = config.Id
+	HeartBeatTimer := time.NewTicker(100 * time.Second)
+	ResetHeartBeatTimer(HeartBeatTimer)
 	for{
+		if node.CurrentStateType != StateType_Leader{
+			return
+		}
 		select {
-			case <-heartbeatTimer.C:
-				if conns[index] == nil{
+			case <-HeartBeatTimer.C:
+				Log("heart beat for peer ",config.Peers[index])
+				if Conns[index] == nil{
 					continue
 				}
-				err := conns[index].Call("RaftRpc.HeartBeat",raft,&raft)
-				if err != nil{
-					Log(err)
+				err := Conns[index].Call("RaftRpc.HeartBeat",raft,&raft)
+				if err != nil && LinkType[index] == LinkStateType_Connected{
+					Connect(index)
 				}
-				if raft.Alive == false{
-					Log(config.Peers[index]," is dead.")
-					go func(i int){
-						var err error
-					LOOP:
-						conns[i],err = rpc.DialHTTP("tcp", config.Peers[i])
-						if err != nil{
-							goto LOOP
-						}
-					}(index)
-				}else{
-					Log(config.Peers[index]," is alive.")
-					raft.Alive = false
+				if raft.Log == "become follower"{
+					BecomeFollower()
+					HeartBeatTimer.Stop()
+					return
 				}
 		}
 	}
 }
 func main(){
 	done := make(chan struct{})
-	go Init()
+	Init()
+	go Election()
 	<- done
 }

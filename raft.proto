@@ -5,11 +5,27 @@ enum MessageType{
   MsgBeat = 0;
   MsgVote = 1;
 }
-
+enum StateType{
+    Follower = 0;
+    Leader = 1;
+    Candidate = 2;
+}
+enum LinkStateType{
+  Connecting = 0;
+  Connected = 1;
+  Disconnected = 2;
+}
 message Raft {
   MessageType Type = 1;
-  int64 CurrentTerm = 2;
+  int64 Term = 2;
   int64 VotedFor = 3;
-  bool Alive = 4;
-  bool Reject = 5;
+  string Log = 4;
+}
+message Node {
+  StateType CurrentStateType = 1;
+  int64 ElectionTimeout = 2;
+  int64 HeartBeatTimeout = 3;
+  int64 VoteCount = 4;
+  int64 Term = 5;
+  int64 VoteFor = 6;
 }
