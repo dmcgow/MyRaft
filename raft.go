@@ -128,13 +128,6 @@ func Init(){
 			log.Fatal(err)
 		}
 	}(config.Ip)
-	for i := 0;i < int(config.ClusterSize);i ++{
-		LinkType[i] = LinkStateType_Disconnected
-		if config.Id == int64(i + 1){
-			continue
-		}
-		go Connect(i)
-	}
 	BecomeFollower()
 	fmt.Println("become follower")
 }
@@ -156,6 +149,16 @@ func BecomeFollower(){
 	mu.Unlock()
 }
 func BecomeCandidate(){
+	for i := 0;i < int(config.ClusterSize);i ++{
+		if LinkType[i] != LinkStateType_Disconnected{
+			continue
+		}
+		LinkType[i] = LinkStateType_Disconnected
+		if config.Id == int64(i + 1){
+			continue
+		}
+		go Connect(i)
+	}
 	mu.Lock()
 	Log("I am candidate in term ",node.Term," when ",time.Now())
 	node.CurrentStateType = StateType_Candidate
